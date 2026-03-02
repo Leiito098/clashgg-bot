@@ -12,11 +12,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config desde variables de entorno ────────────────────────────────────
-CLASH_EMAIL    = os.environ["CLASH_EMAIL"]
-CLASH_PASSWORD = os.environ["CLASH_PASSWORD"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+REFRESH_TOKEN    = os.environ["CLASH_REFRESH_TOKEN"]
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "15"))  # segundos
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "15"))
 
 
 # ─── Telegram ──────────────────────────────────────────────────────────────
@@ -34,68 +33,82 @@ async def send_telegram(text: str):
             log.error(f"Error enviando Telegram: {e}")
 
 
-# ─── Login ─────────────────────────────────────────────────────────────────
-async def do_login(page):
-    log.info("Iniciando login en Clash.GG...")
-    await page.goto("https://clash.gg", wait_until="networkidle")
-    await asyncio.sleep(3)
-
-    # Busca botón de login / Sign In
-    try:
-        sign_in = page.locator("button:has-text('Sign In'), a:has-text('Sign In'), button:has-text('Login')")
-        await sign_in.first.click()
-        await asyncio.sleep(2)
-    except Exception:
-        log.warning("No encontró botón Sign In, puede que ya esté logueado")
-        return
-
-    # Completa email y password
-    try:
-        await page.fill("input[type='email'], input[name='email']", CLASH_EMAIL)
-        await page.fill("input[type='password'], input[name='password']", CLASH_PASSWORD)
-        await page.click("button[type='submit'], button:has-text('Sign In'), button:has-text('Login')")
-        await asyncio.sleep(5)
-        log.info("Login completado")
-    except Exception as e:
-        log.error(f"Error en login: {e}")
-        raise
+# ─── Inyectar cookies de sesión ────────────────────────────────────────────
+async def inject_session(context):
+    log.info("Inyectando sesión con refresh_token...")
+    await context.add_cookies([
+        {
+            "name": "refresh_token",
+            "value": REFRESH_TOKEN,
+            "domain": "clash.gg",
+            "path": "/api/auth",
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "None"
+        }
+    ])
 
 
 # ─── Verificar si está logueado ────────────────────────────────────────────
 async def is_logged_in(page) -> bool:
     try:
-        # Si existe el avatar o el balance, estamos logueados
-        await page.wait_for_selector(
-            "[class*='avatar'], [class*='balance'], [class*='user']",
-            timeout=5000
-        )
-        return True
+        count = await page.locator(
+            "[class*='avatar'], [class*='balance'], [class*='userMenu'], "
+            "button:has-text('Withdraw'), button:has-text('Deposit')"
+        ).count()
+        return count > 0
     except Exception:
         return False
+
+
+# ─── Refrescar sesión via API ──────────────────────────────────────────────
+async def refresh_session(page):
+    try:
+        await page.goto("https://clash.gg/api/auth/refresh", wait_until="networkidle")
+        await asyncio.sleep(2)
+        await page.goto("https://clash.gg", wait_until="networkidle")
+        await asyncio.sleep(3)
+    except Exception as e:
+        log.error(f"Error al refrescar sesión: {e}")
 
 
 # ─── Loop principal ────────────────────────────────────────────────────────
 async def monitor(page):
     join_clicked = False
     notified     = False
+    session_ok   = False
 
     log.info(f"Monitoreando Rain Pool cada {CHECK_INTERVAL}s...")
 
     while True:
         try:
-            # Recarga la página para tener estado fresco
             await page.reload(wait_until="networkidle")
             await asyncio.sleep(3)
 
             # Verificar sesión activa
             if not await is_logged_in(page):
-                log.warning("Sesión expirada, relogueando...")
-                await do_login(page)
-                await asyncio.sleep(5)
-                continue
+                if not session_ok:
+                    log.info("Sesión no activa, intentando refrescar...")
+                    await refresh_session(page)
+                    await asyncio.sleep(3)
 
-            # ── Buscar botón Join (no Joined) ──────────────────────────────
-            # "Joined" indica que ya participás, "Join" que está disponible
+                    if not await is_logged_in(page):
+                        log.error("No se pudo iniciar sesión. Token expirado?")
+                        await send_telegram(
+                            "⚠️ <b>Bot Clash.GG</b>\n\n"
+                            "No pudo iniciar sesión.\n"
+                            "El <b>refresh_token</b> expiró — actualizá la variable "
+                            "<code>CLASH_REFRESH_TOKEN</code> en Railway."
+                        )
+                        await asyncio.sleep(300)
+                        continue
+                    else:
+                        session_ok = True
+                        log.info("Sesión activa ✅")
+            else:
+                session_ok = True
+
+            # ── Buscar botón Join / Joined ─────────────────────────────────
             joined_btn = page.locator("button:has-text('Joined')")
             join_btn   = page.locator("button:has-text('Join')")
 
@@ -103,7 +116,6 @@ async def monitor(page):
             join_visible   = await join_btn.is_visible()   if await join_btn.count() > 0 else False
 
             if joined_visible:
-                # Ya estamos en el pool — resetear flags para el próximo ciclo
                 log.info("Estado: YA en el Rain Pool (Joined) ✅")
                 join_clicked = False
                 notified     = False
@@ -116,23 +128,23 @@ async def monitor(page):
 
                 # Detectar si apareció captcha
                 captcha_visible = await page.locator(
-                    "[class*='captcha'], [class*='slider'], [class*='puzzle']"
+                    "[class*='captcha'], [class*='slider'], [class*='puzzle'], "
+                    "[class*='Captcha'], [class*='modal']"
                 ).count() > 0
 
                 if captcha_visible and not notified:
                     await send_telegram(
                         "🎮 <b>Clash.GG Rain Pool</b>\n\n"
-                        "⚠️ ¡Se abrió el <b>CAPTCHA</b>!\n"
-                        "👉 Entrá a <a href='https://clash.gg'>clash.gg</a> y resolvé el slider.\n\n"
+                        "⚠️ ¡Apareció el <b>CAPTCHA</b>!\n"
+                        "👉 Entrá a <a href='https://clash.gg'>clash.gg</a> y mové el slider.\n\n"
                         "⏱ Tenés ~60 segundos antes de que expire."
                     )
                     notified = True
-                    log.info("Notificación de captcha enviada a Telegram")
 
                 elif not captcha_visible and not notified:
                     await send_telegram(
                         "🎮 <b>Clash.GG Rain Pool</b>\n\n"
-                        "✅ ¡Join hecho automáticamente!\n"
+                        "✅ ¡Join automático exitoso!\n"
                         "🌧 Ya estás en el Rain Pool."
                     )
                     notified = True
@@ -162,12 +174,16 @@ async def main():
                 "Chrome/120.0.0.0 Safari/537.36"
             )
         )
-        page = await context.new_page()
 
-        await send_telegram("🤖 <b>Bot Clash.GG iniciado</b>\nMonitoreando Rain Pool...")
+        await inject_session(context)
+
+        page = await context.new_page()
+        await page.goto("https://clash.gg", wait_until="networkidle")
+        await asyncio.sleep(3)
+
+        await send_telegram("🤖 <b>Bot Clash.GG iniciado</b>\nMonitoreando Rain Pool con sesión Steam...")
 
         try:
-            await do_login(page)
             await monitor(page)
         except KeyboardInterrupt:
             log.info("Bot detenido manualmente")
