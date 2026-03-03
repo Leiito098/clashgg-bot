@@ -171,26 +171,40 @@ async def monitor(page, tg_session: aiohttp.ClientSession):
             await page.goto(CLASH_HOME, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             await asyncio.sleep(1.2)
 
-            # Verificar sesión activa
-            if not await is_logged_in(page):
-                if session_ok:
-                    log.warning("Sesión parece caída. Intentando refrescar…")
-                session_ok = False
-
-                await refresh_session(page)
-                await asyncio.sleep(1.5)
-
-                if not await is_logged_in(page):
-                    log.error("No se pudo iniciar sesión. Token expirado o cookie inválida.")
+            # ── Heartbeat ───────────────────────────────────────────────
+            if HEARTBEAT_MINUTES > 0:
+                now = time.time()
+                if now - last_heartbeat >= HEARTBEAT_MINUTES * 60:
                     await send_telegram(
                         tg_session,
-                        "⚠️ <b>Bot Clash.GG</b>\n\n"
-                        "No pudo iniciar sesión.\n"
-                        "Probable <b>refresh_token</b> expirado o cookie inválida.\n\n"
-                        "Actualizá <code>CLASH_REFRESH_TOKEN</code> en Railway.",
+                        "✅ <b>Bot Clash.GG</b>\nSigo online y monitoreando Rain Pool.",
                     )
-                    # Esperar más para no spamear
-                    await asyncio.sleep(300)
+                    last_heartbeat = now
+
+            # ── Verificar sesión con “streak” ───────────────────────────
+            logged = await is_logged_in(page)
+            if not logged:
+                login_fail_streak += 1
+                log.warning(f"Sesión parece caída (streak={login_fail_streak}). Intentando refrescar…")
+                await refresh_session(page)
+
+                # Re-check después de refrescar
+                logged2 = await is_logged_in(page)
+                if not logged2:
+                    # Solo avisar si falló varias veces seguidas
+                    if login_fail_streak >= LOGIN_FAILS_TO_ALERT:
+                        log.error("No se pudo verificar sesión tras varios intentos seguidos.")
+                        await send_telegram(
+                            tg_session,
+                            "⚠️ <b>Bot Clash.GG</b>\n\n"
+                            "No pude verificar la sesión tras varios intentos.\n"
+                            "Puede ser que el refresh_token esté vencido o que la UI no cargue bien en Railway.\n\n"
+                            "Revisá el login / token en Railway.",
+                        )
+                        # Pausa larga para no spamear
+                        await asyncio.sleep(300)
+                    # Saltar este ciclo (no buscamos join si no tenemos UI confiable)
+                    await asyncio.sleep(sleep_with_jitter(CHECK_INTERVAL, JITTER_MIN, JITTER_MAX))
                     continue
                 else:
                     log.info("Sesión activa ✅")
@@ -289,6 +303,10 @@ async def main():
                     if not browser or not context or not page:
                         log.info("Levantando Chromium/context/page…")
                         browser, context, page = await start_browser(p)
+                        await send_telegram(
+                            tg_session,
+                            "🤖 <b>Bot Clash.GG iniciado</b>\nMonitoreando Rain Pool…",
+                        )
 
                     await monitor(page, tg_session)
 
