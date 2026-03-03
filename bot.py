@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 import random
-from typing import Optional
+import time
 
 import aiohttp
 from playwright.async_api import async_playwright, Error as PlaywrightError
@@ -11,28 +11,42 @@ from playwright.async_api import async_playwright, Error as PlaywrightError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Config desde variables de entorno ─────────────────────────────────────
+# ─── Helpers ───────────────────────────────────────────────────────────────
 def env_required(key: str) -> str:
     v = os.getenv(key)
     if not v:
         raise RuntimeError(f"Falta variable de entorno obligatoria: {key}")
     return v
 
+def sleep_with_jitter(base: int, jitter_min: int, jitter_max: int) -> float:
+    return max(3, base + random.randint(jitter_min, jitter_max))
+
+async def safe_close(obj):
+    try:
+        await obj.close()
+    except Exception:
+        pass
+
+# ─── Config desde variables de entorno ─────────────────────────────────────
 REFRESH_TOKEN = env_required("CLASH_REFRESH_TOKEN")
 TELEGRAM_TOKEN = env_required("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = env_required("TELEGRAM_CHAT_ID")
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))  # mejor default para Railway
-JITTER_MIN = int(os.getenv("JITTER_MIN", "3"))           # variación anti patrón
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "25"))
+JITTER_MIN = int(os.getenv("JITTER_MIN", "3"))
 JITTER_MAX = int(os.getenv("JITTER_MAX", "8"))
 
-# Cada cuántos ciclos reiniciar la página para evitar leaks/crashes
 PAGE_RECYCLE_EVERY = int(os.getenv("PAGE_RECYCLE_EVERY", "120"))
+
+# Login check: cuántos fallos seguidos para considerar “realmente deslogueado”
+LOGIN_FAILS_TO_ALERT = int(os.getenv("LOGIN_FAILS_TO_ALERT", "3"))
+
+# Heartbeat: cada cuántos minutos mandar “sigo vivo”
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", "360"))  # 6 horas por defecto
 
 CLASH_HOME = "https://clash.gg"
 CLASH_REFRESH = "https://clash.gg/api/auth/refresh"
 
-# Timeouts razonables para server
 NAV_TIMEOUT_MS = int(os.getenv("NAV_TIMEOUT_MS", "45000"))
 ACTION_TIMEOUT_MS = int(os.getenv("ACTION_TIMEOUT_MS", "15000"))
 
@@ -53,19 +67,16 @@ async def send_telegram(session: aiohttp.ClientSession, text: str):
     except Exception as e:
         log.error(f"Error enviando Telegram: {e}")
 
-
 # ─── Inyectar cookies de sesión ────────────────────────────────────────────
 async def inject_session(context):
     log.info("Inyectando cookie refresh_token...")
-    # Nota: en muchos sitios el path suele ser "/" (más compatible).
-    # Si tu token solo funciona con "/api/auth", podés volver a eso.
     await context.add_cookies(
         [
             {
                 "name": "refresh_token",
                 "value": REFRESH_TOKEN,
                 "domain": "clash.gg",
-                "path": "/",  # <-- cambio importante (más compatible)
+                "path": "/",  # más compatible
                 "httpOnly": True,
                 "secure": True,
                 "sameSite": "None",
@@ -73,30 +84,36 @@ async def inject_session(context):
         ]
     )
 
-
-# ─── Verificar si está logueado ────────────────────────────────────────────
+# ─── Verificar si está logueado (heurística mejorada con espera) ───────────
 async def is_logged_in(page) -> bool:
+    """
+    Sigue siendo heurístico (UI), pero:
+    - esperamos un poco por si el layout tarda en hidratar
+    - buscamos varios indicadores
+    """
     try:
         loc = page.locator(
             "[class*='avatar'], [class*='balance'], [class*='userMenu'], "
             "button:has-text('Withdraw'), button:has-text('Deposit')"
         )
+        # Pequeña espera para evitar falsos negativos por hidratación
+        try:
+            await loc.first.wait_for(timeout=2500)
+        except Exception:
+            pass
         return (await loc.count()) > 0
     except Exception:
         return False
 
-
 # ─── Refrescar sesión via API ──────────────────────────────────────────────
 async def refresh_session(page):
     try:
-        # ⚠️ NO usar networkidle en sitios con sockets
         await page.goto(CLASH_REFRESH, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.2)
         await page.goto(CLASH_HOME, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.8)
     except Exception as e:
         log.error(f"Error al refrescar sesión: {e}")
-
 
 # ─── Crear navegador/context/page ──────────────────────────────────────────
 async def start_browser(p):
@@ -108,7 +125,6 @@ async def start_browser(p):
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--no-zygote",
-            # estas dos ayudan bastante en containers; si te dieran issues raros, las sacamos.
             "--disable-features=site-per-process",
         ],
     )
@@ -133,34 +149,27 @@ async def start_browser(p):
 
     return browser, context, page
 
-
-async def safe_close(obj):
-    try:
-        await obj.close()
-    except Exception:
-        pass
-
-
-def sleep_with_jitter(base: int) -> float:
-    return max(3, base + random.randint(JITTER_MIN, JITTER_MAX))
-
-
 # ─── Loop principal ────────────────────────────────────────────────────────
 async def monitor(page, tg_session: aiohttp.ClientSession):
     join_clicked = False
     notified = False
-    session_ok = False
     cycles = 0
 
-    log.info(f"Monitoreando Rain Pool cada ~{CHECK_INTERVAL}s (con jitter)...")
+    # Para evitar falsos “token expirado”
+    login_fail_streak = 0
+
+    # Heartbeat
+    last_heartbeat = time.time()
+
+    log.info(f"Monitoreando Rain Pool cada ~{CHECK_INTERVAL}s (con jitter {JITTER_MIN}-{JITTER_MAX})...")
 
     while True:
         cycles += 1
 
         try:
-            # En vez de reload + networkidle: usar goto domcontentloaded (más estable)
+            # Navegar a home (más estable que reload con sitios con sockets)
             await page.goto(CLASH_HOME, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.2)
 
             # Verificar sesión activa
             if not await is_logged_in(page):
@@ -173,17 +182,23 @@ async def monitor(page, tg_session: aiohttp.ClientSession):
 
                 if not await is_logged_in(page):
                     log.error("No se pudo iniciar sesión. Token expirado o cookie inválida.")
-                    
+                    await send_telegram(
+                        tg_session,
+                        "⚠️ <b>Bot Clash.GG</b>\n\n"
+                        "No pudo iniciar sesión.\n"
+                        "Probable <b>refresh_token</b> expirado o cookie inválida.\n\n"
+                        "Actualizá <code>CLASH_REFRESH_TOKEN</code> en Railway.",
+                    )
                     # Esperar más para no spamear
                     await asyncio.sleep(300)
                     continue
                 else:
-                    session_ok = True
                     log.info("Sesión activa ✅")
+                    login_fail_streak = 0
             else:
-                session_ok = True
+                login_fail_streak = 0
 
-            # Buscar botones Join / Joined
+            # ── Buscar botones Join / Joined ────────────────────────────
             joined_btn = page.locator("button:has-text('Joined')")
             join_btn = page.locator("button:has-text('Join')")
 
@@ -196,50 +211,60 @@ async def monitor(page, tg_session: aiohttp.ClientSession):
                 notified = False
 
             elif join_visible and not join_clicked:
-                log.info("¡Botón JOIN detectado! Click…")
-                await join_btn.click(timeout=ACTION_TIMEOUT_MS)
-                join_clicked = True
-                await asyncio.sleep(2)
+                # 🔥 FIX: Si el botón está deshabilitado, NO intentes clickear
+                enabled = False
+                try:
+                    enabled = await join_btn.is_enabled()
+                except Exception:
+                    enabled = False
 
-                # Detectar si apareció captcha (heurística)
-                captcha_visible = (await page.locator(
-                    "[class*='captcha'], [class*='slider'], [class*='puzzle'], "
-                    "[class*='Captcha'], [class*='modal']"
-                ).count()) > 0
+                if not enabled:
+                    log.info("JOIN visible pero está disabled. Esperando habilitación…")
+                    # esperamos un toque y dejamos que el siguiente ciclo reintente
+                    await asyncio.sleep(2.0)
 
-                if captcha_visible and not notified:
-                    await send_telegram(
-                        tg_session,
-                        "🎮 <b>Clash.GG Rain Pool</b>\n\n"
-                        "⚠️ Apareció el <b>CAPTCHA</b>.\n"
-                        "👉 Abrí <a href='https://clash.gg'>clash.gg</a> y resolvelo.\n\n"
-                        "⏱ Suele expirar rápido.",
-                    )
-                    notified = True
+                else:
+                    log.info("¡Botón JOIN detectado y habilitado! Click…")
+                    await join_btn.click(timeout=ACTION_TIMEOUT_MS)
+                    join_clicked = True
+                    await asyncio.sleep(2)
 
-                elif not captcha_visible and not notified:
-                    await send_telegram(
-                        tg_session,
-                        "🎮 <b>Clash.GG Rain Pool</b>\n\n"
-                        "✅ Click en Join hecho.\n"
-                        "🌧 Revisá que figure Joined.",
-                    )
-                    notified = True
+                    # Detectar si apareció captcha (heurística)
+                    captcha_visible = (await page.locator(
+                        "[class*='captcha'], [class*='slider'], [class*='puzzle'], "
+                        "[class*='Captcha'], [class*='modal']"
+                    ).count()) > 0
 
+                    if captcha_visible and not notified:
+                        await send_telegram(
+                            tg_session,
+                            "🎮 <b>Clash.GG Rain Pool</b>\n\n"
+                            "⚠️ Apareció el <b>CAPTCHA</b>.\n"
+                            "👉 Abrí <a href='https://clash.gg'>clash.gg</a> y resolvelo.\n\n"
+                            "⏱ Suele expirar rápido.",
+                        )
+                        notified = True
+
+                    elif not captcha_visible and not notified:
+                        await send_telegram(
+                            tg_session,
+                            "🎮 <b>Clash.GG Rain Pool</b>\n\n"
+                            "✅ Click en Join hecho.\n"
+                            "🌧 Revisá que figure Joined.",
+                        )
+                        notified = True
             else:
                 log.info("Rain Pool: botón Join no disponible aún…")
 
-            # Reciclar página cada N ciclos para evitar crashes por memory/leaks
+            # ── Reciclar página cada N ciclos ────────────────────────────
             if PAGE_RECYCLE_EVERY > 0 and cycles % PAGE_RECYCLE_EVERY == 0:
                 log.warning(f"Reciclando page para estabilidad (cycle={cycles})…")
                 await safe_close(page)
-                # el caller se encarga de recrearla: levantamos excepción controlada
                 raise RuntimeError("RECYCLE_PAGE")
 
         except PlaywrightError as e:
-            # Crashes típicos: "Page crashed", "Target closed", etc.
             log.error(f"Playwright error en loop: {e}")
-            raise  # que el supervisor reinicie
+            raise  # supervisor reinicia
 
         except Exception as e:
             if str(e) == "RECYCLE_PAGE":
@@ -247,10 +272,9 @@ async def monitor(page, tg_session: aiohttp.ClientSession):
             log.error(f"Error en loop: {e}")
             await asyncio.sleep(10)
 
-        await asyncio.sleep(sleep_with_jitter(CHECK_INTERVAL))
+        await asyncio.sleep(sleep_with_jitter(CHECK_INTERVAL, JITTER_MIN, JITTER_MAX))
 
-
-# ─── Supervisor (reinicia si crashea page/browser) ─────────────────────────
+# ─── Supervisor ────────────────────────────────────────────────────────────
 async def main():
     async with aiohttp.ClientSession() as tg_session:
         await send_telegram(tg_session, "🤖 <b>Bot Clash.GG</b>\nIniciando…")
@@ -275,7 +299,6 @@ async def main():
                 except Exception as e:
                     log.error(f"Supervisor: reiniciando por error: {e}")
 
-                    # Cerrar limpio
                     if page:
                         await safe_close(page)
                     if context:
@@ -284,10 +307,7 @@ async def main():
                         await safe_close(browser)
 
                     page = context = browser = None
-
-                    # Backoff para no reiniciar en loop infinito
                     await asyncio.sleep(8)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
