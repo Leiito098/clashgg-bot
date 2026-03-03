@@ -173,13 +173,7 @@ async def monitor(page, tg_session: aiohttp.ClientSession):
 
                 if not await is_logged_in(page):
                     log.error("No se pudo iniciar sesión. Token expirado o cookie inválida.")
-                    await send_telegram(
-                        tg_session,
-                        "⚠️ <b>Bot Clash.GG</b>\n\n"
-                        "No pudo iniciar sesión.\n"
-                        "Probable <b>refresh_token</b> expirado o cookie inválida.\n\n"
-                        "Actualizá <code>CLASH_REFRESH_TOKEN</code> en Railway.",
-                    )
+                    
                     # Esperar más para no spamear
                     await asyncio.sleep(300)
                     continue
@@ -271,10 +265,6 @@ async def main():
                     if not browser or not context or not page:
                         log.info("Levantando Chromium/context/page…")
                         browser, context, page = await start_browser(p)
-                        await send_telegram(
-                            tg_session,
-                            "🤖 <b>Bot Clash.GG iniciado</b>\nMonitoreando Rain Pool…",
-                        )
 
                     await monitor(page, tg_session)
 
